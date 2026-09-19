@@ -87,22 +87,58 @@ namespace WinHarness {
 
         // ============ 参数解析 ============
 
-        // 解析 "-Key value" 与开关 "-Flag"（开关记为 ""）
+        // 判断 token 是「选项名」还是「值」。
+        //
+        // 关键：负数（如 -1281）以 '-' 开头，但它是【值】不是选项。
+        // 若不做这个区分，位于左/上副屏（负坐标区域）的窗口，其 -X/-Y 会被解析成"无值开关"，
+        // 导致 click / hover / drag / scroll / pixel 在负坐标显示器上全部不可用。
+        static bool LooksLikeOption(string s) {
+            if (string.IsNullOrEmpty(s) || s[0] != '-') return false;   // 不以 - 开头 → 是值
+            string body = s.Substring(1);
+            if (body.Length == 0) return true;                          // 单个 "-" → 选项
+            if (body[0] == '-') return true;                            // "--xxx" → 长选项
+            double tmp;
+            if (double.TryParse(body, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out tmp)) return false;  // -123 / -1.5 → 是值
+            return true;
+        }
+
+        // 解析 "-Key value"、开关 "-Flag"（记为 ""）、以及 "-Key=value" 形式。
+        // "=" 形式是给「值本身以 - 开头」的字符串留的逃生口，例如 launch -Args=-Dfoo。
         static Dictionary<string, string> ParseArgs(string[] args, int start) {
             var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = start; i < args.Length; i++) {
                 string a = args[i];
-                if (a.StartsWith("-")) {
-                    string key = a.TrimStart('-');
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-")) {
-                        d[key] = args[i + 1];
-                        i++;
-                    } else {
-                        d[key] = "";
-                    }
+                if (!LooksLikeOption(a)) continue;                      // 游离的值：忽略
+
+                int eq = a.IndexOf('=');
+                if (eq > 1) {
+                    d[a.Substring(1, eq - 1)] = a.Substring(eq + 1);
+                    continue;
+                }
+
+                string key = a.TrimStart('-');
+                if (i + 1 < args.Length && !LooksLikeOption(args[i + 1])) {
+                    d[key] = args[i + 1];
+                    i++;
+                } else {
+                    d[key] = "";
                 }
             }
             return d;
+        }
+
+        // 必填整数参数：区分「未提供」与「提供了但无效」，避免误导性报错。
+        // 接受负数（负坐标显示器必需）。
+        static int RequireInt(Dictionary<string, string> o, string key, string usage) {
+            string v;
+            if (!o.TryGetValue(key, out v)) throw new Exception("缺少 -" + key + "（" + usage + "）");
+            int n;
+            if (!int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out n)) {
+                throw new Exception("-" + key + " 值无效: \"" + v + "\"（需要整数，可为负数。若值本身以 - 开头，可用 -" + key + "=值 形式）");
+            }
+            return n;
         }
 
         static string Opt(Dictionary<string, string> o, string key, string def = null) {
@@ -232,9 +268,14 @@ namespace WinHarness {
             bool dbl = Flag(o, "Double");
             bool right = Flag(o, "Right");
 
-            int px = OptInt(o, "X", -1);
-            int py = OptInt(o, "Y", -1);
-            if (px >= 0 && py >= 0) {
+            // 坐标模式：显式给了 -X/-Y 就【必须】走坐标路径。
+            // 不能用 "值 >= 0" 判断是否走坐标 —— 负坐标（左/上副屏）是合法值，
+            // 旧实现用 -1 同时当"未提供"的哨兵和合法值，导致负坐标在逻辑上被排除。
+            bool hasX = o.ContainsKey("X"), hasY = o.ContainsKey("Y");
+            if (hasX || hasY) {
+                if (!hasX || !hasY) throw new Exception("坐标不完整：-X 与 -Y 必须成对提供");
+                int px = RequireInt(o, "X", "屏幕 X 坐标，可为负数");
+                int py = RequireInt(o, "Y", "屏幕 Y 坐标，可为负数");
                 var p = InputSim.ClickPoint(px, py, dbl, right);
                 var resPt = new Dictionary<string, object>();
                 resPt["clicked"] = "point";
@@ -243,7 +284,13 @@ namespace WinHarness {
                 return resPt;
             }
 
+            // 元素模式：必须至少给一个定位条件。
+            // 否则会掉进"无过滤条件查找"并报「匹配到 N 个元素」，把"参数丢了"伪装成"元素歧义"，
+            // 排障方向会被彻底带偏（历史真实故障）。
             var spec = GetSpec(o);
+            if (spec.IsEmpty) {
+                throw new Exception("需要指定 -X -Y 坐标，或元素条件（-Name / -NameB64 / -AutomationId / -Type / -Class）");
+            }
             bool idxExplicit;
             int idx = GetIndex(o, out idxExplicit);
             var el = Uia.ResolveOne(win, spec, idx, idxExplicit);
@@ -480,6 +527,7 @@ namespace WinHarness {
             int ry = OptInt(o, "Y", int.MinValue);
             int rw = OptInt(o, "Width", int.MinValue);
             int rh = OptInt(o, "Height", int.MinValue);
+            int reqX = int.MinValue, reqY = int.MinValue, reqW = int.MinValue, reqH = int.MinValue;
             if (rx != int.MinValue || ry != int.MinValue || rw != int.MinValue || rh != int.MinValue) {
                 Native.RECT cr;
                 Native.GetWindowRect(h, out cr);
@@ -489,7 +537,8 @@ namespace WinHarness {
                 int nh = rh != int.MinValue ? rh : cr.Bottom - cr.Top;
                 if (nw <= 0 || nh <= 0) throw new Exception("无效尺寸: " + nw + "x" + nh);
                 Native.SetWindowPos(h, IntPtr.Zero, nx, ny, nw, nh, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
-                applied.Add("rect=" + nx + "," + ny + "," + nw + "x" + nh);
+                reqX = nx; reqY = ny; reqW = nw; reqH = nh;
+                applied.Add("rect");
                 Thread.Sleep(300);
             }
 
@@ -521,15 +570,34 @@ namespace WinHarness {
 
             if (applied.Count == 0) throw new Exception("没有可执行的窗口操作，请指定 -State / -X -Y / -Width -Height / -MoveToMonitor / -Center");
 
-            // 回读（UIA 坐标）
+            // 回读（UIA 坐标）—— 这是【权威】结果
             var b = win.Current.BoundingRectangle;
+            int ax = Uia.F(b.X), ay = Uia.F(b.Y), aw = Uia.F(b.Width), ah = Uia.F(b.Height);
+
             var res = new Dictionary<string, object>();
             res["title"] = win.Current.Name;
             res["hwnd"] = win.Current.NativeWindowHandle;
-            res["applied"] = applied;
-            res["rect"] = new Dictionary<string, object> {
-                { "x", Uia.F(b.X) }, { "y", Uia.F(b.Y) }, { "w", Uia.F(b.Width) }, { "h", Uia.F(b.Height) }
+            res["applied"] = applied;                 // 已执行的动作名列表（不含几何结果，避免与 rect 冲突）
+            res["rect"] = new Dictionary<string, object> {   // 执行后的实际几何，一切以它为准
+                { "x", ax }, { "y", ay }, { "w", aw }, { "h", ah }
             };
+
+            // 若请求了几何，明确区分「请求值」与「实得值」，并在不一致时解释原因。
+            // 同一响应里出现两个矛盾的矩形而不加说明，会把调用方带偏（历史真实困扰）。
+            if (reqX != int.MinValue) {
+                res["requested_rect"] = new Dictionary<string, object> {
+                    { "x", reqX }, { "y", reqY }, { "w", reqW }, { "h", reqH }
+                };
+                if (reqX != ax || reqY != ay || reqW != aw || reqH != ah) {
+                    res["geometry_note"] = string.Format(
+                        "请求 ({0},{1}) {2}x{3} 与实得 ({4},{5}) {6}x{7} 不一致 —— 常见原因：目标应用的最小尺寸限制，或跨显示器 DPI 不同导致的尺寸换算。请以 rect 为准。注意：窗口移动/改尺寸后，之前记录的屏幕坐标已失效，需重新读取 rect 或重新截图。",
+                        reqX, reqY, reqW, reqH, ax, ay, aw, ah);
+                }
+            }
+
+            Native.RECT wr;
+            Native.GetWindowRect(h, out wr);
+            res["monitor_index"] = Screens.IndexOf(wr);
             res["dpi_awareness"] = Native.DpiMode;
             return res;
         }
@@ -662,8 +730,8 @@ namespace WinHarness {
 
         // 光标移动；同时报告光标下的元素（对无 UIA 的自绘 UI 尤其有价值：能探测到"外壳"这一层）
         static object CmdHover(Dictionary<string, string> o) {
-            int x = OptInt(o, "X", int.MinValue), y = OptInt(o, "Y", int.MinValue);
-            if (x == int.MinValue || y == int.MinValue) throw new Exception("需要 -X -Y");
+            int x = RequireInt(o, "X", "屏幕 X 坐标，可为负数");
+            int y = RequireInt(o, "Y", "屏幕 Y 坐标，可为负数");
             EnsureTargetForeground(o);
             InputSim.MoveTo(x, y);
             var res = new Dictionary<string, object>();
@@ -721,8 +789,8 @@ namespace WinHarness {
         }
 
         static object CmdScroll(Dictionary<string, string> o) {
-            int x = OptInt(o, "X", int.MinValue), y = OptInt(o, "Y", int.MinValue);
-            if (x == int.MinValue || y == int.MinValue) throw new Exception("需要 -X -Y（滚轮事件发送到光标所在位置）");
+            int x = RequireInt(o, "X", "滚轮事件发送到光标所在位置，可为负数");
+            int y = RequireInt(o, "Y", "滚轮事件发送到光标所在位置，可为负数");
             int delta = OptInt(o, "Delta", -120);
             int times = OptInt(o, "Times", 1);
             EnsureTargetForeground(o);
@@ -812,8 +880,8 @@ namespace WinHarness {
         }
 
         // 取色（自绘 UI 的视觉验证手段）
-        static object CmdPixel(Dictionary<string, string> o) {            int x = OptInt(o, "X", int.MinValue), y = OptInt(o, "Y", int.MinValue);
-            if (x == int.MinValue || y == int.MinValue) throw new Exception("需要 -X -Y");
+        static object CmdPixel(Dictionary<string, string> o) {            int x = RequireInt(o, "X", "屏幕 X 坐标，可为负数");
+            int y = RequireInt(o, "Y", "屏幕 Y 坐标，可为负数");
             using (var bmp = new System.Drawing.Bitmap(1, 1))
             using (var g = System.Drawing.Graphics.FromImage(bmp)) {
                 g.CopyFromScreen(x, y, 0, 0, new System.Drawing.Size(1, 1));
