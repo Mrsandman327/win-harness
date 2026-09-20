@@ -1,6 +1,7 @@
-# win-harness
-
-Windows 桌面自动化 CLI（单文件 exe，零依赖）。基于 Windows UI Automation（元素树）+ MSAA 回退通道 + SendInput（真实输入）+ GDI（截图）。
+---
+name: win-harness
+description: Windows 桌面自动化 CLI（单文件 exe，零依赖）。基于 Windows UI Automation（元素树）+ MSAA 回退通道 + SendInput（真实输入）+ GDI（截图）。
+---
 
 ## 快速开始
 
