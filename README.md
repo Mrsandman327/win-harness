@@ -1,4 +1,4 @@
-# win-harness
+# win-harness-skill
 
 Windows 桌面自动化 CLI。单文件 exe，零依赖（.NET Framework 4.x 自带 `csc.exe` 编译），面向 AI agent 调用。
 
