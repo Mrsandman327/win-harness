@@ -73,9 +73,15 @@ namespace WinHarness {
             if (spec.StartsWith("hwnd:")) {
                 long h;
                 if (!long.TryParse(spec.Substring(5), out h)) throw new Exception("hwnd 格式错误: " + spec);
-                var el = AutomationElement.FromHandle(new IntPtr(h));
-                if (el == null) throw new Exception("hwnd " + h + " 无有效 UIA 元素");
-                return el;
+                if (h == 0 || !Native.IsWindow(new IntPtr(h)))
+                    throw new Exception("hwnd " + h + " 不是有效窗口（可能已关闭）");
+                try {
+                    var el = AutomationElement.FromHandle(new IntPtr(h));
+                    if (el == null) throw new Exception("hwnd " + h + " 无有效 UIA 元素");
+                    return el;
+                } catch (System.Runtime.InteropServices.COMException ce) {
+                    throw new Exception("hwnd " + h + " UIA 访问失败 0x" + ((uint)ce.HResult).ToString("X8") + ": " + ce.Message);
+                }
             }
             if (spec.StartsWith("pid:")) {
                 int pid;
@@ -118,7 +124,6 @@ namespace WinHarness {
         public static bool FocusWindow(AutomationElement win) {
             var h = new IntPtr(win.Current.NativeWindowHandle);
             if (Native.IsIconic(h)) Native.ShowWindow(h, Native.SW_RESTORE);
-            Native.ShowWindow(h, Native.SW_RESTORE);
 
             uint targetPid;
             uint targetThread = Native.GetWindowThreadProcessId(h, out targetPid);
@@ -151,7 +156,8 @@ namespace WinHarness {
             return fgPid == targetPid;
         }
 
-        // 导出元素树（ControlView 广度优先，深度/数量限制 + 可选名称过滤）
+        // 导出元素树（ControlView 广度优先，深度/数量限制 + 可选过滤）
+        // filter: 裸值=Name 包含；name:X / class:X / aid:X / type:X = 按字段包含
         public static List<Dictionary<string, object>> GetTree(AutomationElement root, int depth, string filter, int max) {
             var list = new List<Dictionary<string, object>>();
             var walker = TreeWalker.ControlViewWalker;
@@ -164,7 +170,7 @@ namespace WinHarness {
                 if (d > 0) {
                     try {
                         string name = el.Current.Name;
-                        if (string.IsNullOrEmpty(filter) || (name != null && name.Contains(filter))) {
+                        if (MatchFilter(el, name, filter)) {
                             list.Add(Info(el, d));
                         }
                     } catch { }
@@ -180,6 +186,27 @@ namespace WinHarness {
                 }
             }
             return list;
+        }
+
+        // 树过滤器：裸值按 Name 包含匹配（兼容旧行为）；"字段:值" 可按字段过滤。
+        // 支持 name:/class:/aid:(automationid:)/type:，未知字段一律不匹配。
+        static bool MatchFilter(AutomationElement el, string name, string filter) {
+            if (string.IsNullOrEmpty(filter)) return true;
+            int c = filter.IndexOf(':');
+            if (c <= 0) return name != null && name.Contains(filter);   // 裸值 = 仅 Name
+            string field = filter.Substring(0, c).ToLowerInvariant();
+            string val = filter.Substring(c + 1);
+            Func<AutomationElement, string> get;
+            switch (field) {
+                case "name": get = e => e.Current.Name; break;
+                case "class": get = e => e.Current.ClassName; break;
+                case "aid": case "automationid": get = e => e.Current.AutomationId; break;
+                case "type": get = e => TypeName(e); break;
+                default: return false;
+            }
+            string s = null;
+            try { s = get(el); } catch { return false; }   // UIA 可能抛 ElementNotAvailable
+            return s != null && s.Contains(val);
         }
 
         // 查找元素：按名称（包含）/ 类型过滤（旧签名，保留兼容）

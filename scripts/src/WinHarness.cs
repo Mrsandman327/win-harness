@@ -43,6 +43,10 @@ namespace WinHarness {
                 var result = new Dictionary<string, object>();
                 result["ok"] = false;
                 result["error"] = ex.Message;
+                result["error_type"] = ex.GetType().Name;
+                result["hresult"] = "0x" + ((uint)ex.HResult).ToString("X8");
+                var w32 = ex as System.ComponentModel.Win32Exception;
+                if (w32 != null) result["win32_error"] = w32.NativeErrorCode;
                 Console.WriteLine(MiniJson.Serialize(result));
                 return 1;
             }
@@ -71,6 +75,7 @@ namespace WinHarness {
                 case "read": return CmdRead(opts);
                 case "getprop": return CmdGetProp(opts);
                 case "pixel": return CmdPixel(opts);
+                case "ocr": return CmdOcr(opts);
                 case "do": return CmdDo(opts);
                 default: throw new Exception("未知命令: " + cmd + "（运行 win-harness.exe help 查看用法）");
             }
@@ -894,6 +899,82 @@ namespace WinHarness {
             }
         }
 
+        // ocr：截取窗口 / 指定矩形做 OCR，文本坐标换算回屏幕绝对坐标
+        static object CmdOcr(Dictionary<string, string> o) {
+            bool hasAny = o.ContainsKey("X") || o.ContainsKey("Y") || o.ContainsKey("Width") || o.ContainsKey("Height");
+            Native.RECT rect;
+            if (hasAny) {
+                if (!(o.ContainsKey("X") && o.ContainsKey("Y") && o.ContainsKey("Width") && o.ContainsKey("Height")))
+                    throw new Exception("坐标不完整：-X -Y -Width -Height 必须同时提供（或都不给，改用 -Window）");
+                int x = RequireInt(o, "X", "屏幕 X 坐标，可为负数");
+                int y = RequireInt(o, "Y", "屏幕 Y 坐标，可为负数");
+                int w = RequireInt(o, "Width", "截图宽度");
+                int h = RequireInt(o, "Height", "截图高度");
+                rect = new Native.RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+            } else {
+                var win = ResolveWin(o);
+                long hwnd = win.Current.NativeWindowHandle;
+                var b = win.Current.BoundingRectangle;
+                int x = Uia.F(b.X), y = Uia.F(b.Y), w = Uia.F(b.Width), h = Uia.F(b.Height);
+                if (w <= 0 || h <= 0) {                                   // UIA 矩形无效时退回 Win32
+                    Native.RECT wr;
+                    Native.GetWindowRect(new IntPtr(hwnd), out wr);
+                    x = wr.Left; y = wr.Top; w = wr.Right - wr.Left; h = wr.Bottom - wr.Top;
+                }
+                rect = new Native.RECT { Left = x, Top = y, Right = x + w, Bottom = y + h };
+            }
+
+            int upscale = OptInt(o, "Upscale", 2);
+            if (upscale < 1) upscale = 1;
+            string lang = Opt(o, "Lang", "zh-Hans");
+            string outPath = Opt(o, "Out");
+
+            var cap = ScreenCap.Capture(rect, -1, outPath);               // {path,x,y,w,h}
+            int rx = Convert.ToInt32(cap["x"]), ry = Convert.ToInt32(cap["y"]);
+            string png = (string)cap["path"];
+
+            Dictionary<string, object> ocr;
+            try {
+                ocr = OcrRunner.Recognize(png, lang, upscale);
+            } finally {
+                // 未指定 -Out 时清理自动生成的临时截图
+                if (string.IsNullOrEmpty(outPath)) { try { File.Delete(png); } catch { } }
+            }
+
+            // 原图像素坐标 + 截图区域原点 = 屏幕绝对坐标
+            var lines = new List<Dictionary<string, object>>();
+            foreach (var l in (List<Dictionary<string, object>>)ocr["lines"]) {
+                var nl = new Dictionary<string, object>();
+                nl["text"] = l["text"];
+                OffsetInto(nl, l, rx, ry);
+                var ws = new List<Dictionary<string, object>>();
+                foreach (var wd in (List<Dictionary<string, object>>)l["words"]) {
+                    var nw = new Dictionary<string, object>();
+                    nw["text"] = wd["text"];
+                    OffsetInto(nw, wd, rx, ry);
+                    ws.Add(nw);
+                }
+                nl["words"] = ws;
+                lines.Add(nl);
+            }
+
+            var res = new Dictionary<string, object>();
+            res["engine"] = ocr["engine"];
+            res["region"] = new Dictionary<string, object> {
+                { "x", rx }, { "y", ry }, { "w", Convert.ToInt32(cap["w"]) }, { "h", Convert.ToInt32(cap["h"]) }
+            };
+            res["lines"] = lines;
+            return res;
+        }
+
+        // 把 src 中的 x/y 加上区域原点写入 dst（w/h 原样保留）
+        static void OffsetInto(Dictionary<string, object> dst, Dictionary<string, object> src, int ox, int oy) {
+            dst["x"] = Convert.ToInt32(src["x"]) + ox;
+            dst["y"] = Convert.ToInt32(src["y"]) + oy;
+            dst["w"] = src["w"];
+            dst["h"] = src["h"];
+        }
+
         // 批处理：一次进程执行多步子命令（每步子命令本来要各自启动一次 .NET 进程，约 150-300ms）。
         // 例: do -Ops "focus -Window 计算器 ; click -AutomationId num1Button ; key -Keys ENTER"
         static object CmdDo(Dictionary<string, string> o) {
@@ -954,6 +1035,7 @@ namespace WinHarness {
 命令:
   windows   [-Filter <标题包含>] [-Pid <n>]              枚举顶层窗口
   tree      -Window <定位> [-Depth 3] [-Filter <文本>]    导出元素树(扁平)
+            -Filter 可为裸值(仅匹配 Name)或 name:X / class:X / aid:X / type:X（按字段包含）
   find      -Window <定位> [-Name <>|-NameB64 <>] [-Type Button]   查找元素(含可点击点)
   click     -Window <定位> (-Name <>|-NameB64 <>| -X n -Y n) [-Index 0] [-Double] [-Right] [-Scroll]
             [-Via auto|click|select|toggle|invoke|expand] [-ForceClick]
@@ -977,6 +1059,8 @@ namespace WinHarness {
   read      -Window <定位> [-Name <>|-AutomationId <>] [-Index n]   读元素文本(值/文本/名称)
   getprop   -Window <定位> [-Name <>|-AutomationId <>] [-Index n]   读元素属性与支持的 Pattern
   pixel     -X <n> -Y <n>                                 取屏幕像素颜色(视觉验证)
+  ocr       [-Window <定位> | -X -Y -Width -Height] [-Upscale 2] [-Lang zh-Hans] [-Out <路径>]
+                                                           截屏 OCR，返回带屏幕坐标的文本行/词
   do        -Ops <子命令1 ; 子命令2 ; ...>                 批处理，一次进程执行多步(省进程启动开销)
   b64       -Text <>                                      文本转 base64(UTF-8)
 
